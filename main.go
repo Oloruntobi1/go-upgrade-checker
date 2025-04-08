@@ -33,6 +33,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to generate SCIP index for my module: %v", err)
 	}
+	defer os.RemoveAll(filepath.Dir(myIndexPath))
 
 	moduleToUpgrade := module
 
@@ -44,6 +45,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
+	defer os.RemoveAll(filepath.Dir(oldModuleIndexPath))
 
 	newModuleIndexPath, err := cloneAndRunCommand(
 		fmt.Sprintf("https://%s.git", moduleToUpgrade),
@@ -53,6 +55,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
+	defer os.RemoveAll(filepath.Dir(newModuleIndexPath))
 
 	usedFunctions, err := findUsedFunctions(myIndexPath, oldModuleIndexPath, moduleToUpgrade)
 	if err != nil {
