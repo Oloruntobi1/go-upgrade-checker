@@ -27,37 +27,41 @@ func main() {
 	flag.StringVar(&newVersion, "new-version", "", "New version of the dependency")
 	flag.Parse()
 
-	myModulePath := projectPath
-
-	myIndexPath, err := generateScipIndex(myModulePath)
+	projectIndexPath, err := generateScipIndex(projectPath)
 	if err != nil {
 		log.Fatalf("Failed to generate SCIP index for my module: %v", err)
 	}
-	defer os.RemoveAll(filepath.Dir(myIndexPath))
+	defer os.RemoveAll(filepath.Dir(projectIndexPath))
 
-	moduleToUpgrade := module
-
-	oldModuleIndexPath, err := cloneAndRunCommand(
-		fmt.Sprintf("https://%s.git", moduleToUpgrade),
-		oldVersion,
-	)
+	// Clone repository once
+	repoDir, err := os.MkdirTemp("", "repo-clone-*")
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+		log.Fatalf("Failed to create temp directory: %v", err)
+	}
+	defer os.RemoveAll(repoDir)
+
+	repoURL := fmt.Sprintf("https://%s.git", module)
+	gitCloneCmd := exec.Command("git", "clone", repoURL, repoDir)
+	gitCloneCmd.Stderr = os.Stderr
+	if err := gitCloneCmd.Run(); err != nil {
+		log.Fatalf("Failed to clone repository: %v", err)
+	}
+
+	// Generate index for old version
+	oldModuleIndexPath, err := generateIndexForVersion(repoDir, oldVersion)
+	if err != nil {
+		log.Fatalf("Failed to generate index for old version: %v", err)
 	}
 	defer os.RemoveAll(filepath.Dir(oldModuleIndexPath))
 
-	newModuleIndexPath, err := cloneAndRunCommand(
-		fmt.Sprintf("https://%s.git", moduleToUpgrade),
-		newVersion,
-	)
+	// Generate index for new version
+	newModuleIndexPath, err := generateIndexForVersion(repoDir, newVersion)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+		log.Fatalf("Failed to generate index for new version: %v", err)
 	}
 	defer os.RemoveAll(filepath.Dir(newModuleIndexPath))
 
-	usedFunctions, err := findUsedFunctions(myIndexPath, oldModuleIndexPath, moduleToUpgrade)
+	usedFunctions, err := findUsedFunctions(projectIndexPath, oldModuleIndexPath, module)
 	if err != nil {
 		log.Fatalf("Failed to find used functions: %v", err)
 	}
@@ -69,6 +73,9 @@ func main() {
 
 	changed := findChangedFunctions(usedFunctions, newFunctions)
 
+	// add a new line
+	fmt.Println()
+
 	if len(changed) > 0 {
 		fmt.Println("The following functions have been changed or removed:")
 		for fn, newFn := range changed {
@@ -77,6 +84,43 @@ func main() {
 	} else {
 		fmt.Println("No breaking changes detected.")
 	}
+}
+
+// generateIndexForVersion checks out a specific version and generates its SCIP index
+func generateIndexForVersion(repoDir, version string) (string, error) {
+	// Checkout the specific version
+	gitCheckoutCmd := exec.Command("git", "checkout", version)
+	gitCheckoutCmd.Dir = repoDir
+	gitCheckoutCmd.Stderr = os.Stderr
+	if err := gitCheckoutCmd.Run(); err != nil {
+		return "", fmt.Errorf("failed to checkout version %s: %w", version, err)
+	}
+
+	// Create output directory for the index
+	outputDir, err := os.MkdirTemp("", "scip-index-*")
+	if err != nil {
+		return "", fmt.Errorf("failed to create temp dir: %w", err)
+	}
+
+	outputPath := filepath.Join(outputDir, "index.scip")
+
+	// Run scip-go
+	cmd := exec.Command("scip-go",
+		"--verbose",
+		"--output", outputPath,
+		"--project-root", repoDir,
+		"--repository-root", repoDir,
+		"./...", // Index all packages recursively
+	)
+	cmd.Dir = repoDir
+	cmd.Stderr = os.Stderr
+
+	if err := cmd.Run(); err != nil {
+		os.RemoveAll(outputDir)
+		return "", fmt.Errorf("failed to run scip-go: %w", err)
+	}
+
+	return outputPath, nil
 }
 
 // generateScipIndex runs scip-go on a module and returns the path to the index file
@@ -95,6 +139,7 @@ func generateScipIndex(moduleLocation string) (string, error) {
 	cmd := exec.Command("scip-go", "--output", outputPath, targetPath)
 	cmd.Dir = moduleLocation
 	if err := cmd.Run(); err != nil {
+		os.RemoveAll(outputDir)
 		return "", fmt.Errorf("failed to run scip-go: %w", err)
 	}
 
@@ -258,50 +303,4 @@ func findChangedFunctions(
 	}
 
 	return changed
-}
-
-func cloneAndRunCommand(repoURL, version string) (string, error) {
-	// Create a temporary directory to clone into
-	tempDir, err := os.MkdirTemp("", "repo-clone-*")
-	if err != nil {
-		return "", fmt.Errorf("failed to create temp directory: %w", err)
-	}
-
-	gitCloneCmd := exec.Command("git", "clone", repoURL, tempDir)
-	gitCloneCmd.Stdout = os.Stdout
-	gitCloneCmd.Stderr = os.Stderr
-	if err := gitCloneCmd.Run(); err != nil {
-		return "", fmt.Errorf("failed to clone repository: %w", err)
-	}
-
-	// Checkout the specific version (could be a tag, branch, or commit hash)
-	gitCheckoutCmd := exec.Command("git", "checkout", version)
-	gitCheckoutCmd.Dir = tempDir
-	gitCheckoutCmd.Stdout = os.Stdout
-	gitCheckoutCmd.Stderr = os.Stderr
-	if err := gitCheckoutCmd.Run(); err != nil {
-		return "", fmt.Errorf("failed to checkout version %s: %w", version, err)
-	}
-
-	// Change directory and run command
-	fmt.Printf("Running command 'scip-go' with verbose output in %s...\n", tempDir)
-	cmd := exec.Command("scip-go",
-		"--verbose",
-		"--output", "index.scip",
-		"--repository-remote", repoURL,
-		"--project-root", tempDir,
-		"--repository-root", tempDir,
-		"./...", // Index all packages recursively
-	)
-	cmd.Dir = tempDir
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-
-	if err := cmd.Run(); err != nil {
-		return "", fmt.Errorf("command failed: %w", err)
-	}
-
-	outputPath := filepath.Join(tempDir, "index.scip")
-
-	return outputPath, nil
 }
