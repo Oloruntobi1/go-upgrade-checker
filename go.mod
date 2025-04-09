@@ -3,6 +3,7 @@ module go-upgrade-checker
 go 1.24.1
 
 require (
+	github.com/google/go-cmp v0.5.9
 	github.com/sourcegraph/scip v0.5.2
 	google.golang.org/protobuf v1.36.6
 )

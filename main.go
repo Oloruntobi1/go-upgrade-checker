@@ -9,8 +9,8 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
-	"unicode"
 
+	"github.com/google/go-cmp/cmp"
 	"github.com/sourcegraph/scip/bindings/go/scip"
 	"google.golang.org/protobuf/proto"
 )
@@ -29,6 +29,7 @@ func main() {
 
 	projectIndexPath, err := generateScipIndex(projectPath)
 	if err != nil {
+		os.RemoveAll(projectIndexPath)
 		log.Fatalf("Failed to generate SCIP index for my module: %v", err)
 	}
 	defer os.RemoveAll(filepath.Dir(projectIndexPath))
@@ -36,6 +37,7 @@ func main() {
 	// Clone repository once
 	repoDir, err := os.MkdirTemp("", "repo-clone-*")
 	if err != nil {
+		os.RemoveAll(repoDir)
 		log.Fatalf("Failed to create temp directory: %v", err)
 	}
 	defer os.RemoveAll(repoDir)
@@ -44,12 +46,14 @@ func main() {
 	gitCloneCmd := exec.Command("git", "clone", repoURL, repoDir)
 	gitCloneCmd.Stderr = os.Stderr
 	if err := gitCloneCmd.Run(); err != nil {
+		os.RemoveAll(repoDir)
 		log.Fatalf("Failed to clone repository: %v", err)
 	}
 
 	// Generate index for old version
 	oldModuleIndexPath, err := generateIndexForVersion(repoDir, oldVersion)
 	if err != nil {
+		os.RemoveAll(oldModuleIndexPath)
 		log.Fatalf("Failed to generate index for old version: %v", err)
 	}
 	defer os.RemoveAll(filepath.Dir(oldModuleIndexPath))
@@ -57,29 +61,34 @@ func main() {
 	// Generate index for new version
 	newModuleIndexPath, err := generateIndexForVersion(repoDir, newVersion)
 	if err != nil {
+		os.RemoveAll(newModuleIndexPath)
 		log.Fatalf("Failed to generate index for new version: %v", err)
 	}
 	defer os.RemoveAll(filepath.Dir(newModuleIndexPath))
 
-	usedFunctions, err := findUsedFunctions(projectIndexPath, oldModuleIndexPath, module)
+	usedSymbols, err := findUsedSymbols(projectIndexPath, oldModuleIndexPath, module)
 	if err != nil {
-		log.Fatalf("Failed to find used functions: %v", err)
+		log.Fatalf("Failed to find used symbols: %v", err)
 	}
 
-	newFunctions, err := getAvailableFunctions(newModuleIndexPath)
+	newSymbols, err := getAvailableSymbols(newModuleIndexPath)
 	if err != nil {
-		log.Fatalf("Failed to find new functions: %v", err)
+		log.Fatalf("Failed to find used symbols: %v", err)
 	}
 
-	changed := findChangedFunctions(usedFunctions, newFunctions)
+	added, removed := findChangedSymbols(usedSymbols, newSymbols)
 
-	// add a new line
 	fmt.Println()
 
-	if len(changed) > 0 {
-		fmt.Println("The following functions have been changed or removed:")
-		for fn, newFn := range changed {
-			fmt.Println("- " + fn + " -> " + newFn)
+	if len(added) > 0 || len(removed) > 0 {
+		fmt.Println("The following symbols have been changed or removed:")
+		fmt.Println("Added:")
+		for sym, newSym := range added {
+			fmt.Println("- " + sym + " -> " + newSym)
+		}
+		fmt.Println("Removed:")
+		for sym, newSym := range removed {
+			fmt.Println("- " + sym + " -> " + newSym)
 		}
 	} else {
 		fmt.Println("No breaking changes detected.")
@@ -146,31 +155,36 @@ func generateScipIndex(moduleLocation string) (string, error) {
 	return outputPath, nil
 }
 
-// findUsedFunctions analyzes a SCIP index to find functions used from a module
-func findUsedFunctions(indexPath, oldModuleIndexPath, moduleName string) (map[string]struct{}, error) {
+// findUsedSymbols analyzes the user project's SCIP index to find symbols it uses
+// that originate from the specified targetModule
+func findUsedSymbols(indexPath, oldModuleIndexPath, moduleName string) (map[string][]string, error) {
 	indexData, err := os.ReadFile(indexPath)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read index file: %w", err)
+		return nil, fmt.Errorf("failed to read user index file '%s': %w", indexPath, err)
 	}
 
 	var index scip.Index
 	if err := proto.Unmarshal(indexData, &index); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal index: %w", err)
+		return nil, fmt.Errorf("failed to unmarshal user index '%s': %w", indexPath, err)
 	}
 
-	usedFunctions := make(map[string]struct{})
+	usedSymbols := make(map[string][]string)
 
-	// Iterate through documents in the index
 	for _, doc := range index.Documents {
-		// Iterate through occurrences
 		for _, occ := range doc.Occurrences {
 			if strings.Contains(occ.Symbol, moduleName) {
-				re := regexp.MustCompile(`\w+\(\)\.`)
-				match := re.FindString(occ.Symbol)
-				if match != "" {
-					// remove the ()
-					funcName := strings.TrimSuffix(match, "().")
-					usedFunctions[funcName] = struct{}{}
+				val, typ := extractSymbolsFromOccurrence(occ.Symbol)
+				if val != "" {
+					field := val
+					if typ == "type" {
+						val = strings.Split(val, "#")[0]
+						if len(strings.Split(val, ".")) > 1 {
+							field = strings.Split(val, ".")[1]
+						}
+						usedSymbols[val] = append(usedSymbols[val], field)
+					} else {
+						usedSymbols[val] = append(usedSymbols[val], "")
+					}
 				}
 			}
 		}
@@ -186,22 +200,34 @@ func findUsedFunctions(indexPath, oldModuleIndexPath, moduleName string) (map[st
 		return nil, fmt.Errorf("failed to unmarshal old module index: %w", err)
 	}
 
-	oldModuleUsedFunctions := make(map[string]struct{})
-	// get func signatures
+	oldModuleUsedSymbols := make(map[string][]string)
+
 	for _, doc := range oldModuleIndex.Documents {
 		for _, sym := range doc.Symbols {
-			if len(sym.Documentation) > 0 {
-				funcSignature := extractExportedFunctionSignature(sym.Documentation[0])
-				oldModuleUsedFunctions[funcSignature] = struct{}{}
+			val, typ := extractSymbolsFromOccurrence(sym.Symbol)
+			if val != "" {
+				if len(sym.Documentation) > 0 {
+					def := extractSymbolDefinition(sym.Documentation[0])
+					if def != "" {
+						if typ == "type" {
+							d := strings.Split(val, "#")[0]
+							if len(strings.Split(val, "#")) > 1 {
+								oldModuleUsedSymbols[d] = append(oldModuleUsedSymbols[d], def)
+							}
+						} else {
+							oldModuleUsedSymbols[val] = append(oldModuleUsedSymbols[val], def)
+						}
+					}
+				}
 			}
 		}
 	}
 
-	resultMap := make(map[string]struct{})
-	for k := range usedFunctions {
-		for j := range oldModuleUsedFunctions {
+	resultMap := make(map[string][]string)
+	for k := range usedSymbols {
+		for j, v := range oldModuleUsedSymbols {
 			if strings.Contains(j, k) {
-				resultMap[j] = struct{}{}
+				resultMap[j] = v
 			}
 		}
 	}
@@ -209,36 +235,52 @@ func findUsedFunctions(indexPath, oldModuleIndexPath, moduleName string) (map[st
 	return resultMap, nil
 }
 
-func extractExportedFunctionSignature(s string) string {
-	parts := strings.Split(s, "\n")
+func determineSymbolType(symbol string) string {
+	switch {
+	case strings.Contains(symbol, "()"):
+		return "function"
+	case strings.Contains(symbol, "#"):
+		return "type"
+	default:
+		return "constant or variable"
+	}
+}
+
+func extractSymbolDefinition(symbol string) string {
+	parts := strings.Split(symbol, "\n")
 	if len(parts) < 2 {
 		return ""
 	}
 	// Extract the function definition between \n characters
-	funcDef := parts[1]
+	symbolDef := parts[1]
 
-	// return empty string if the function is not exported
-	// check after the func keyword
-	if !strings.Contains(funcDef, "func") {
-		return ""
-	}
-
-	// Find the function name after "func "
-	afterFunc := funcDef[strings.Index(funcDef, "func ")+5:]
-	// Get the first word which should be the function name
-	funcName := strings.Split(afterFunc, "(")[0]
-	funcName = strings.TrimSpace(funcName)
-
-	// Check if function name starts with uppercase (exported)
-	if len(funcName) == 0 || !unicode.IsUpper(rune(funcName[0])) {
-		return ""
-	}
-
-	return funcDef
+	return symbolDef
 }
 
-// getAvailableFunctions reads a SCIP index to find all exported functions
-func getAvailableFunctions(indexPath string) (map[string]struct{}, error) {
+func extractSymbolsFromOccurrence(symbol string) (string, string) {
+	re := regexp.MustCompile("`[^`]+`(/[^\\s`]+?\\.)")
+	matches := re.FindAllStringSubmatch(symbol, -1)
+	for _, match := range matches {
+		if len(match) > 1 {
+			symbolType := determineSymbolType(match[1])
+			var val string
+			if symbolType == "function" {
+				val = strings.TrimPrefix(match[1], "/")
+				val = strings.TrimSuffix(val, "().")
+			} else if symbolType == "type" {
+				val = strings.TrimPrefix(match[1], "/")
+				val = strings.TrimSuffix(val, ".")
+			} else {
+				val = strings.TrimPrefix(match[1], "/")
+				val = strings.TrimSuffix(val, ".")
+			}
+			return val, symbolType
+		}
+	}
+	return "", ""
+}
+
+func getAvailableSymbols(indexPath string) (map[string][]string, error) {
 	indexData, err := os.ReadFile(indexPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read index file: %w", err)
@@ -249,58 +291,96 @@ func getAvailableFunctions(indexPath string) (map[string]struct{}, error) {
 		return nil, fmt.Errorf("failed to unmarshal index: %w", err)
 	}
 
-	functions := make(map[string]struct{})
+	symbols := make(map[string][]string)
 
 	for _, doc := range index.Documents {
 		for _, sym := range doc.Symbols {
-			funcSignature := extractExportedFunctionSignature(sym.Documentation[0])
-			if funcSignature == "" {
-				continue
+			val, typ := extractSymbolsFromOccurrence(sym.Symbol)
+			if val != "" {
+				if len(sym.Documentation) > 0 {
+					def := extractSymbolDefinition(sym.Documentation[0])
+					if def != "" {
+						if typ == "type" {
+							d := strings.Split(val, "#")[0]
+							if len(strings.Split(val, "#")) > 1 {
+								symbols[d] = append(symbols[d], def)
+							}
+						} else {
+							symbols[val] = append(symbols[val], def)
+						}
+					}
+				}
 			}
-			functions[funcSignature] = struct{}{}
 		}
 	}
 
-	return functions, nil
+	return symbols, nil
 }
 
-// findChangedFunctions compares used functions with available functions and detects signature changes
-func findChangedFunctions(
-	usedFunctions, newFunctions map[string]struct{},
-) map[string]string {
-	changed := make(map[string]string)
+func findChangedSymbols(oldSymbols map[string][]string, newSymbols map[string][]string) (map[string]string, map[string]string) {
+	added := make(map[string]string)
+	removed := make(map[string]string)
 
-	for usedFn := range usedFunctions {
-		// Extract function name before the parameters
-		usedFnName := strings.Split(strings.TrimSpace(usedFn), "(")[0]
-		usedFnName = strings.TrimPrefix(usedFnName, "func ")
-
-		// Look for functions with same name but different signatures in new version
-		for newFn := range newFunctions {
-			newFnName := strings.Split(strings.TrimSpace(newFn), "(")[0]
-			newFnName = strings.TrimPrefix(newFnName, "func ")
-
-			if usedFnName == newFnName {
-				// Found function with same name, check if signatures differ
-				if usedFn != newFn {
-					changed[usedFn] = newFn
+	for oldSymbol, oldSymbolDefs := range oldSymbols {
+		_, exists := newSymbols[oldSymbol]
+		if exists {
+			if cmp.Equal(oldSymbolDefs, newSymbols[oldSymbol]) {
+				continue
+			} else {
+				a, b := difference(oldSymbolDefs, newSymbols[oldSymbol])
+				if len(a) > 0 {
+					removed[oldSymbol] = a[0]
 				}
-				break
+				if len(b) > 0 {
+					added[oldSymbol] = b[0]
+				}
 			}
 		}
 
 		// Also mark completely removed functions
 		found := false
-		for newFn := range newFunctions {
-			if strings.Contains(newFn, usedFnName) {
+		for newFn := range newSymbols {
+			if strings.Contains(newFn, oldSymbol) {
 				found = true
 				break
 			}
 		}
 		if !found {
-			changed[usedFn] = "removed"
+			removed[oldSymbol] = "removed"
 		}
 	}
 
-	return changed
+	return added, removed
+}
+
+// difference returns two slices:
+// - items in a but not in b
+// - items in b but not in a
+func difference(a, b []string) ([]string, []string) {
+	aMap := make(map[string]bool)
+	bMap := make(map[string]bool)
+
+	for _, item := range a {
+		aMap[item] = true
+	}
+	for _, item := range b {
+		bMap[item] = true
+	}
+
+	var onlyInA []string
+	var onlyInB []string
+
+	for _, item := range a {
+		if !bMap[item] {
+			onlyInA = append(onlyInA, item)
+		}
+	}
+
+	for _, item := range b {
+		if !aMap[item] {
+			onlyInB = append(onlyInB, item)
+		}
+	}
+
+	return onlyInA, onlyInB
 }
